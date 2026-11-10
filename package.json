@@ -1,7 +1,7 @@
 {
   "name": "samsung-remote-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for Samsung Smart TV remote control actions reconstructed from public evidence of Remote for Samsung (id1455009028 / com.osfunapps.tv-samsung-remote-ios).",
+  "version": "2.0.0",
+  "description": "Public hosted HTTP/SSE & Stdio MCP server for Samsung Smart TV remote control actions with per-session saved TVs (LAN WebSocket/TCP + SmartThings Cloud).",
   "type": "module",
   "main": "./src/mcp-server.mjs",
   "bin": {
@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node ./src/mcp-server.mjs",
+    "start:http": "node ./src/mcp-server.mjs --http",
     "doctor": "node ./src/mcp-server.mjs --doctor",
     "test": "node ./test/verify-mcp.mjs"
   },

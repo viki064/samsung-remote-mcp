@@ -34,7 +34,7 @@ import {
 
 const SERVER_INFO = {
   name: 'samsung-remote-mcp',
-  version: '1.0.0'
+  version: '2.0.0'
 };
 
 const SESSION_ID_PROP = {
@@ -1341,6 +1341,134 @@ export async function processJsonRpcRequest(msg, sessionId = 'default') {
   }
 }
 
+/**
+ * Public Hosted HTTP MCP Server (no Bearer token required):
+ * - POST /mcp (Streamable HTTP JSON-RPC; issues & honors `Mcp-Session-Id` header or `?sessionId=`)
+ * - GET /sse & POST /messages?sessionId=<id> (HTTP+SSE transport with automatic session isolation)
+ * - GET /health (Deployment healthcheck)
+ */
+export function startHttpMcpServer({ host = '0.0.0.0', port = 3000 } = {}) {
+  const sseClients = new Map();
+
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id');
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    if (req.method === 'GET' && url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          healthy: true,
+          public: true,
+          auth_enabled: false,
+          session_scoped_tvs: true,
+          server: SERVER_INFO,
+          transport: 'streamable-http+sse',
+          tool_count: TOOLS.length
+        })
+      );
+      return;
+    }
+
+    // Legacy SSE endpoint (`GET /sse`)
+    if (req.method === 'GET' && url.pathname === '/sse') {
+      const sessionId = normalizeSessionId(url.searchParams.get('sessionId') || crypto.randomUUID());
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'Mcp-Session-Id': sessionId
+      });
+      sseClients.set(sessionId, res);
+      res.write(`event: endpoint\ndata: /messages?sessionId=${encodeURIComponent(sessionId)}\n\n`);
+      req.on('close', () => {
+        sseClients.delete(sessionId);
+      });
+      return;
+    }
+
+    // Streamable HTTP (`POST /mcp`) or SSE message endpoint (`POST /messages`)
+    if (req.method === 'POST' && (url.pathname === '/mcp' || url.pathname === '/messages')) {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      let parsed;
+      try {
+        parsed = JSON.parse(rawBody);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+        return;
+      }
+
+      const headerSessionId = req.headers['mcp-session-id'];
+      const querySessionId = url.searchParams.get('sessionId') || url.searchParams.get('session_id');
+      const isInit =
+        (!Array.isArray(parsed) && parsed?.method === 'initialize') ||
+        (Array.isArray(parsed) && parsed.some((m) => m?.method === 'initialize'));
+
+      const sessionId = normalizeSessionId(
+        headerSessionId || querySessionId || (isInit ? crypto.randomUUID() : 'default')
+      );
+      res.setHeader('Mcp-Session-Id', sessionId);
+
+      const responses = Array.isArray(parsed)
+        ? (await Promise.all(parsed.map((item) => processJsonRpcRequest(item, sessionId)))).filter(Boolean)
+        : [await processJsonRpcRequest(parsed, sessionId)].filter(Boolean);
+
+      if (url.pathname === '/messages' && sseClients.has(sessionId)) {
+        const sseRes = sseClients.get(sessionId);
+        for (const r of responses) {
+          sseRes.write(`event: message\ndata: ${JSON.stringify(r)}\n\n`);
+        }
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ accepted: true, sessionId }));
+        return;
+      }
+
+      if (responses.length === 0) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(Array.isArray(parsed) ? responses : responses[0]));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: 'Not found',
+        endpoints: {
+          mcp_streamable_http: 'POST /mcp',
+          mcp_sse: 'GET /sse',
+          mcp_sse_messages: 'POST /messages',
+          health: 'GET /health'
+        }
+      })
+    );
+  });
+
+  return new Promise((resolve) => {
+    server.listen(port, host, () => {
+      resolve(server);
+    });
+  });
+}
 
 async function main() {
   if (process.argv.includes('--doctor')) {
@@ -1348,10 +1476,13 @@ async function main() {
       JSON.stringify(
         {
           healthy: true,
+          public: true,
+          auth_enabled: false,
+          session_scoped_tvs: true,
           server: SERVER_INFO,
           tool_count: TOOLS.length,
           tools: TOOLS.map((t) => t.name),
-          transports: ['stdio'],
+          transports: ['stdio', 'streamable-http (/mcp)', 'sse (/sse)'],
           state_file: getStateFilePath()
         },
         null,
@@ -1361,6 +1492,33 @@ async function main() {
     return;
   }
 
+  const useHttp =
+    process.argv.includes('--http') ||
+    process.env.MCP_TRANSPORT === 'http' ||
+    Boolean(process.env.PORT && !process.stdin.isTTY === false);
+
+  if (useHttp) {
+    const portIndex = process.argv.indexOf('--port');
+    const port = Number(
+      (portIndex !== -1 && process.argv[portIndex + 1]) || process.env.PORT || 3000
+    );
+    const host = process.env.HOST || '0.0.0.0';
+    const server = await startHttpMcpServer({ host, port });
+    const addr = server.address();
+    console.error(
+      JSON.stringify({
+        status: 'listening',
+        public: true,
+        server: SERVER_INFO,
+        url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${addr.port}/mcp`,
+        sse_url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${addr.port}/sse`,
+        health_url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${addr.port}/health`
+      })
+    );
+    return;
+  }
+
+  const stdioSessionId = normalizeSessionId(process.env.MCP_SESSION_ID || 'default');
   const rl = readline.createInterface({
     input: process.stdin,
     terminal: false
@@ -1378,7 +1536,7 @@ async function main() {
       );
       return;
     }
-    const response = await processJsonRpcRequest(parsed, 'default');
+    const response = await processJsonRpcRequest(parsed, stdioSessionId);
     if (response) {
       process.stdout.write(`${JSON.stringify(response)}\n`);
     }

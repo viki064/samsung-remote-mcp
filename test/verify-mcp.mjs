@@ -49,10 +49,10 @@ async function main() {
     const initRes = await rpc('initialize', {
       protocolVersion: '2025-11-25',
       capabilities: {},
-      clientInfo: { name: 'verify-mcp', version: '1.0.0' }
+      clientInfo: { name: 'verify-mcp', version: '2.0.0' }
     });
     assert.equal(initRes.serverInfo.name, 'samsung-remote-mcp');
-    assert.equal(initRes.serverInfo.version, '1.0.0');
+    assert.equal(initRes.serverInfo.version, '2.0.0');
 
     // 2. List tools (14 tools)
     const listRes = await rpc('tools/list');

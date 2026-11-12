@@ -24,7 +24,7 @@ An MCP server exposing the remote control, touchpad, keyboard, app launcher, and
 ### 2. Unknowns & Limitations
 - Apple does not provide unauthenticated `.ipa` downloads from `apps.apple.com` without an Apple account/device, and App Store `.ipa` binaries are protected by Apple FairPlay DRM (which REA does not bypass per `CONTRIBUTING.md`). Therefore, the closed-source Mach-O binary inside `com.osfunapps.tv-samsung-remote-ios` was not decompiled.
 
-## Exposed MCP Tools (12 Tools)
+## Exposed MCP Tools (14 Tools)
 
 | Tool | App Feature (`id1455009028`) | Protocol / Mechanism |
 |---|---|---|
@@ -39,5 +39,43 @@ An MCP server exposing the remote control, touchpad, keyboard, app launcher, and
 | `touchpad_control` | Touchpad Swipe & Click | Tizen `ms.remote.control` (`ProcessMouseDevice`, `Move` / `LeftClick` / `RightClick`) |
 | `list_tv_apps` | Screen 5 Apps Tab | Built-in Tizen app catalog + live `ms.channel.emit` (`ed.installedApp.get`) |
 | `launch_tv_app` | Screen 5 One-Touch App Launch | `POST http://<ip>:8001/api/v2/applications/<appId>` or WebSocket `ed.apps.launch` |
+| `dial_app` | DIAL app launch / status / stop | DIAL `http://<ip>:8080/ws/apps/<App>` (GET status, POST launch, DELETE stop), verifies state before/after |
 | `cast_media_url` | Screen 4 & 6 Cast to TV | YouTube DIAL (`POST http://<ip>:8080/ws/apps/YouTube`) or `org.tizen.browser` deep-link |
 | `list_supported_keys` | Button & Key Catalog | 50+ UI button aliases + 245+ Samsung `KEY_*` codes |
+
+
+## Local deployment (Debian mini, Tailscale)
+
+This server is intended to run on the same LAN as the TV, not in the cloud.
+On the mini (`samsung-mcp`, Debian 13, Node 20+):
+
+```
+node src/mcp-server.mjs --http   # listens on 0.0.0.0:3000, /health, /mcp
+```
+
+Local addresses: `http://192.168.86.166:3000/mcp` on home Wi-Fi,
+`http://100.106.184.32:3000/mcp` over Tailscale. The public Render copy
+cannot discover or control a TV — SSDP discovery is link-local.
+
+Note: the server currently runs via `nohup` and does not auto-start after
+a reboot. Add a systemd unit if you want it to survive restarts.
+
+## Discovery caveat
+
+`discover_tvs` is SSDP-only (`M-SEARCH` to 239.255.255.250:1900). It does
+not wake a TV that is off / asleep — the TV must be on to answer, and to
+be discovered the first time. `wake_tv` is a separate Wake-on-LAN tool and
+needs the TV's MAC address, which you only get after discovering it while
+it is on. There is no SmartThings / cloud control in this server; all
+control is local LAN (Tizen WebSocket `wss://:8002`, plain `ws://:8001`,
+or legacy TCP `:55000`).
+
+## DIAL fallback
+
+`dial_app` exists because some apps do not launch via the Tizen appId route.
+On the TU7000 (UN75TU700DFXZA), Netflix's catalog appId `11101200001`
+returns 404 on `POST /api/v2/applications/11101200001` and the WebSocket
+`ed.apps.launch` frame reports ok without opening anything, while DIAL
+`POST http://<ip>:8080/ws/apps/Netflix` (empty body, `Content-Length: 0`)
+returns 201 and the app opens. `dial_app` re-reads the DIAL state after a
+launch/stop, so its result is verified, not fire-and-forget.

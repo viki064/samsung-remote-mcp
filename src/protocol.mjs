@@ -182,6 +182,34 @@ export function resolveKeyCode(inputKey) {
   return upper;
 }
 
+// DIAL (Discovery and Launch) app names are case-sensitive and differ from the
+// Tizen appId catalog in KNOWN_TV_APPS. Verified on the TU7000 (UN75TU700DFXZA):
+// the catalog Netflix appId 11101200001 returns 404 on POST
+// /api/v2/applications/11101200001, while DIAL POST /ws/apps/Netflix returns 201
+// and the app opens. Only map names we have verified; anything else passes
+// through as given, since DIAL names are exact.
+export const DIAL_APP_NAMES = Object.freeze({
+  netflix: 'Netflix',
+  youtube: 'YouTube',
+  spotify: 'Spotify'
+});
+
+export function resolveDialAppName(appName) {
+  if (!appName || typeof appName !== 'string') {
+    throw new Error('DIAL app name must be a non-empty string.');
+  }
+  const trimmed = appName.trim();
+  return DIAL_APP_NAMES[trimmed.toLowerCase()] || trimmed;
+}
+
+export function parseDialAppState(xml) {
+  const pick = (tag) => {
+    const m = String(xml || '').match(new RegExp(`<${tag}>([^<]*)</${tag}>`));
+    return m ? m[1].trim() : null;
+  };
+  return { name: pick('name'), state: pick('state'), version: pick('version') };
+}
+
 export function resolveAppId(appIdOrName) {
   if (!appIdOrName || typeof appIdOrName !== 'string') {
     throw new Error('App name or ID must be a non-empty string.');
@@ -284,8 +312,7 @@ export async function saveTvState(stateUpdate, sessionId = 'default') {
   const updatedList = Array.isArray(existingRecord.tvs) ? [...existingRecord.tvs] : [];
   const matchIdx = updatedList.findIndex(
     (item) =>
-      (mergedTv.host && item.host === mergedTv.host) ||
-      (mergedTv.smartThingsDeviceId && item.smartThingsDeviceId === mergedTv.smartThingsDeviceId)
+      mergedTv.host && item.host === mergedTv.host
   );
   if (matchIdx >= 0) {
     updatedList[matchIdx] = { ...updatedList[matchIdx], ...mergedTv };
@@ -935,69 +962,3 @@ export function buildLaunchAppPayload(appId, actionType = 'NATIVE_LAUNCH', metaT
     }
   };
 }
-
-/**
- * Samsung SmartThings Cloud API (`https://api.smartthings.com/v1`) support
- * for cloud-hosted deployments where the MCP server is not on the TV's local LAN.
- */
-export async function smartThingsRequest(endpointPath, { token, method = 'GET', body = null, timeoutMs = 8000 } = {}) {
-  const apiToken = token || process.env.SMARTTHINGS_TOKEN;
-  if (!apiToken) {
-    throw new Error(
-      'Missing SmartThings Personal Access Token. Pass `smartthings_token` or set SMARTTHINGS_TOKEN (create one at https://account.smartthings.com/tokens).'
-    );
-  }
-  const url = `https://api.smartthings.com/v1${endpointPath}`;
-  const payload = body ? JSON.stringify(body) : null;
-  const res = await httpRequest(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      Accept: 'application/json',
-      ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload)) } : {})
-    },
-    body: payload,
-    timeoutMs
-  });
-  let parsed = null;
-  try {
-    parsed = res.body ? JSON.parse(res.body) : null;
-  } catch {
-    parsed = { raw: res.body };
-  }
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    throw new Error(`SmartThings API HTTP ${res.statusCode}: ${res.body}`);
-  }
-  return parsed;
-}
-
-export async function listSmartThingsTvs({ token } = {}) {
-  const data = await smartThingsRequest('/devices', { token });
-  const items = Array.isArray(data?.items) ? data.items : [];
-  return items
-    .filter((d) => {
-      const text = JSON.stringify(d).toLowerCase();
-      return text.includes('television') || text.includes('samsungvd') || text.includes('tv');
-    })
-    .map((d) => ({
-      deviceId: d.deviceId,
-      name: d.name,
-      label: d.label,
-      manufacturerName: d.manufacturerName,
-      Type: d.type
-    }));
-}
-
-export function buildSmartThingsCommandPayload({ capability, command, args = [], component = 'main' }) {
-  return {
-    commands: [
-      {
-        component,
-        capability,
-        command,
-        arguments: args
-      }
-    ]
-  };
-}
-

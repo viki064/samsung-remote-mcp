@@ -11,7 +11,6 @@ import {
   buildLegacyPackets,
   buildRemoteKeyPayload,
   buildSendTextPayload,
-  buildSmartThingsCommandPayload,
   buildTouchpadClickPayload,
   buildTouchpadMovePayload,
   discoverSamsungTvs,
@@ -19,17 +18,17 @@ import {
   fetchTvDeviceInfo,
   getStateFilePath,
   httpRequest,
-  listSmartThingsTvs,
   loadSavedTvState,
   loadSessionTvRecord,
   normalizeSessionId,
+  parseDialAppState,
   resolveAppId,
+  resolveDialAppName,
   resolveKeyCode,
   resolveTargetTv,
   saveTvState,
   sendLegacyTcpKeys,
   sendWakeOnLan,
-  smartThingsRequest
 } from './protocol.mjs';
 
 const SERVER_INFO = {
@@ -113,7 +112,7 @@ export const TOOLS = [
   {
     name: 'get_saved_tv',
     description:
-      'Return the active auto-saved Samsung TV profile and all saved TVs for the current session (host, port, protocol, MAC, pairing token, SmartThings deviceId).',
+      'Return the active auto-saved Samsung TV profile and all saved TVs for the current session (host, port, protocol, MAC, pairing token).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -423,7 +422,46 @@ export const TOOLS = [
     }
   },
   {
+    name: 'dial_app',
+    description:
+      'Launch, check, or stop an app on the Samsung TV via DIAL (Discovery and Launch, http://<host>:8080/ws/apps/<App>). Use this when launch_tv_app fails: e.g. Netflix on the TU7000, whose Tizen appId 11101200001 returns 404 on POST /api/v2/applications, while DIAL POST /ws/apps/Netflix returns 201 and the app opens. Unlike the websocket launch (which reports ok as soon as the frame is sent), this verifies the result by re-reading the app state (stopped/running). DIAL app names are case-sensitive: Netflix, YouTube, Spotify.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['app'],
+      properties: {
+        ...SESSION_ID_PROP,
+        app: {
+          type: 'string',
+          description: 'DIAL app name, e.g. "Netflix", "YouTube", "Spotify".'
+        },
+        action: {
+          type: 'string',
+          enum: ['launch', 'status', 'stop'],
+          description: 'Action to perform (default: "launch").'
+        },
+        payload: {
+          type: 'string',
+          description: 'Optional DIAL launch payload sent as the POST body (e.g. a YouTube video id). Empty by default.'
+        },
+        host: {
+          type: 'string',
+          description: 'TV IPv4 address. Defaults to the current session saved TV.'
+        },
+        port: {
+          type: 'integer',
+          description: 'DIAL port (default: 8080).'
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'When true, return the resolved DIAL app name and URL without network I/O.'
+        }
+      }
+    }
+  },
+  {
     name: 'cast_media_url',
+
     description:
       'Cast a YouTube video link (via DIAL POST http://<host>:8080/ws/apps/YouTube) or open a web/media URL in the Samsung TV browser (org.tizen.browser), matching the Cast to TV feature in id1455009028.',
     inputSchema: {
@@ -456,71 +494,6 @@ export const TOOLS = [
     }
   },
   {
-    name: 'smartthings_cloud_control',
-    description:
-      'Control a Samsung Smart TV from a cloud-hosted MCP server via the Samsung SmartThings Cloud API (https://api.smartthings.com/v1) without requiring direct LAN access. Supports listing TVs, checking status, power on/off, volume/mute, channel up/down/number, input source, and launching apps.',
-    inputSchema: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['operation'],
-      properties: {
-        ...SESSION_ID_PROP,
-        operation: {
-          type: 'string',
-          enum: [
-            'list_tvs',
-            'status',
-            'power_on',
-            'power_off',
-            'volume_up',
-            'volume_down',
-            'set_volume',
-            'mute',
-            'unmute',
-            'channel_up',
-            'channel_down',
-            'set_channel',
-            'set_input_source',
-            'play',
-            'pause',
-            'stop',
-            'custom_command'
-          ],
-          description: 'SmartThings Cloud operation to perform.'
-        },
-        device_id: {
-          type: 'string',
-          description: 'SmartThings TV deviceId (defaults to SMARTTHINGS_DEVICE_ID or current session saved deviceId).'
-        },
-        value: {
-          type: ['string', 'number'],
-          description: 'Value for set_volume (0-100), set_channel, or set_input_source (e.g. "HDMI1").'
-        },
-        capability: {
-          type: 'string',
-          description: 'Capability name when operation="custom_command" (e.g. "switch", "audioVolume", "tvChannel").'
-        },
-        command: {
-          type: 'string',
-          description: 'Command name when operation="custom_command".'
-        },
-        arguments: {
-          type: 'array',
-          items: {},
-          description: 'Command arguments when operation="custom_command".'
-        },
-        smartthings_token: {
-          type: 'string',
-          description: 'SmartThings Personal Access Token override (defaults to SMARTTHINGS_TOKEN env var).'
-        },
-        dry_run: {
-          type: 'boolean',
-          description: 'When true, return the exact SmartThings REST request without network I/O.'
-        }
-      }
-    }
-  },
-  {
     name: 'list_supported_keys',
     description:
       'List all friendly remote button aliases mapped from the Remote for Samsung UI (id1455009028) and the full catalog of 245+ Samsung KEY_* codes.',
@@ -540,62 +513,6 @@ export const TOOLS = [
 function extractYouTubeVideoId(url) {
   const match = String(url).match(/.*(?:youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|shorts\/)([^#&?]*).*/);
   return match && match[1] && match[1].length >= 6 ? match[1] : null;
-}
-
-function mapSmartThingsOperation(operation, args) {
-  switch (operation) {
-    case 'power_on':
-      return buildSmartThingsCommandPayload({ capability: 'switch', command: 'on' });
-    case 'power_off':
-      return buildSmartThingsCommandPayload({ capability: 'switch', command: 'off' });
-    case 'volume_up':
-      return buildSmartThingsCommandPayload({ capability: 'audioVolume', command: 'volumeUp' });
-    case 'volume_down':
-      return buildSmartThingsCommandPayload({ capability: 'audioVolume', command: 'volumeDown' });
-    case 'set_volume':
-      return buildSmartThingsCommandPayload({
-        capability: 'audioVolume',
-        command: 'setVolume',
-        args: [Number(args.value ?? 20)]
-      });
-    case 'mute':
-      return buildSmartThingsCommandPayload({ capability: 'audioMute', command: 'mute' });
-    case 'unmute':
-      return buildSmartThingsCommandPayload({ capability: 'audioMute', command: 'unmute' });
-    case 'channel_up':
-      return buildSmartThingsCommandPayload({ capability: 'tvChannel', command: 'channelUp' });
-    case 'channel_down':
-      return buildSmartThingsCommandPayload({ capability: 'tvChannel', command: 'channelDown' });
-    case 'set_channel':
-      return buildSmartThingsCommandPayload({
-        capability: 'tvChannel',
-        command: 'setTvChannel',
-        args: [String(args.value ?? '1')]
-      });
-    case 'set_input_source':
-      return buildSmartThingsCommandPayload({
-        capability: 'mediaInputSource',
-        command: 'setInputSource',
-        args: [String(args.value ?? 'HDMI1')]
-      });
-    case 'play':
-      return buildSmartThingsCommandPayload({ capability: 'mediaPlayback', command: 'play' });
-    case 'pause':
-      return buildSmartThingsCommandPayload({ capability: 'mediaPlayback', command: 'pause' });
-    case 'stop':
-      return buildSmartThingsCommandPayload({ capability: 'mediaPlayback', command: 'stop' });
-    case 'custom_command':
-      if (!args.capability || !args.command) {
-        throw new Error('custom_command requires `capability` and `command`.');
-      }
-      return buildSmartThingsCommandPayload({
-        capability: args.capability,
-        command: args.command,
-        args: Array.isArray(args.arguments) ? args.arguments : []
-      });
-    default:
-      throw new Error(`Unsupported SmartThings command operation: ${operation}`);
-  }
 }
 
 export async function handleToolCall(name, args = {}, transportSessionId = 'default') {
@@ -1080,7 +997,90 @@ export async function handleToolCall(name, args = {}, transportSessionId = 'defa
       };
     }
 
+    case 'dial_app': {
+      const dialName = resolveDialAppName(args.app);
+      const action = args.action || 'launch';
+      const target = await resolveTargetTv({ ...args, port: args.port || 8080 }, sessionId);
+      const dialUrl = `http://${target.host}:${target.port}/ws/apps/${encodeURIComponent(dialName)}`;
+
+      if (args.dry_run) {
+        return {
+          dry_run: true,
+          session_id: sessionId,
+          requested_app: args.app,
+          dial_app: dialName,
+          action,
+          dial_url: dialUrl,
+          target_host: target.host
+        };
+      }
+
+      const readState = async () => {
+        try {
+          const r = await httpRequest(dialUrl, { method: 'GET', timeoutMs: 6000 });
+          return { status_code: r.statusCode, ...parseDialAppState(r.body) };
+        } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
+      };
+
+      if (action === 'status') {
+        const state = await readState();
+        return {
+          ok: typeof state.status_code === 'number' && state.status_code >= 200 && state.status_code < 300,
+          session_id: sessionId,
+          dial_app: dialName,
+          action,
+          dial_url: dialUrl,
+          ...state
+        };
+      }
+
+      if (action === 'stop') {
+        const res = await httpRequest(dialUrl, {
+          method: 'DELETE',
+          headers: { 'Content-Length': '0' },
+          timeoutMs: 6000
+        });
+        const after = await readState();
+        return {
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          session_id: sessionId,
+          dial_app: dialName,
+          action,
+          dial_url: dialUrl,
+          status_code: res.statusCode,
+          state_after: after.state ?? null
+        };
+      }
+
+      const before = await readState();
+      const payload = args.payload ?? '';
+      const res = await httpRequest(dialUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain',
+          'Content-Length': String(Buffer.byteLength(payload))
+        },
+        body: payload,
+        timeoutMs: 6000
+      });
+      const after = await readState();
+      return {
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        session_id: sessionId,
+        dial_app: dialName,
+        action: 'launch',
+        dial_url: dialUrl,
+        status_code: res.statusCode,
+        state_before: before.state ?? null,
+        state_after: after.state ?? null,
+        response_body: res.body || null
+      };
+    }
+
     case 'cast_media_url': {
+
       const url = args.url;
       const ytVideoId = extractYouTubeVideoId(url);
       const browserFrame = buildLaunchAppPayload('org.tizen.browser', 'NATIVE_LAUNCH', url);
@@ -1137,77 +1137,6 @@ export async function handleToolCall(name, args = {}, transportSessionId = 'defa
         host: target.host,
         port: target.port,
         protocol: session.protocol
-      };
-    }
-
-    case 'smartthings_cloud_control': {
-      const op = args.operation;
-      const token = args.smartthings_token || process.env.SMARTTHINGS_TOKEN;
-      const saved = await loadSavedTvState(sessionId);
-      const deviceId =
-        args.device_id || saved?.smartThingsDeviceId || process.env.SMARTTHINGS_DEVICE_ID || null;
-
-      if (op === 'list_tvs') {
-        if (args.dry_run) {
-          return {
-            dry_run: true,
-            session_id: sessionId,
-            operation: 'list_tvs',
-            endpoint: 'GET https://api.smartthings.com/v1/devices'
-          };
-        }
-        const tvs = await listSmartThingsTvs({ token });
-        if (tvs.length > 0 && !saved?.smartThingsDeviceId) {
-          await saveTvState(
-            { smartThingsDeviceId: tvs[0].deviceId, tvName: tvs[0].label || tvs[0].name },
-            sessionId
-          );
-        }
-        return { session_id: sessionId, count: tvs.length, tvs };
-      }
-
-      if (!deviceId) {
-        throw new Error(
-          `Missing \`device_id\` for session "${sessionId}". Run \`smartthings_cloud_control\` with operation="list_tvs" or pass \`device_id\`.`
-        );
-      }
-
-      if (op === 'status') {
-        if (args.dry_run) {
-          return {
-            dry_run: true,
-            session_id: sessionId,
-            operation: 'status',
-            endpoint: `GET https://api.smartthings.com/v1/devices/${deviceId}/status`
-          };
-        }
-        return smartThingsRequest(`/devices/${encodeURIComponent(deviceId)}/status`, { token });
-      }
-
-      const commandPayload = mapSmartThingsOperation(op, args);
-      if (args.dry_run) {
-        return {
-          dry_run: true,
-          session_id: sessionId,
-          operation: op,
-          device_id: deviceId,
-          endpoint: `POST https://api.smartthings.com/v1/devices/${deviceId}/commands`,
-          payload: commandPayload
-        };
-      }
-
-      const result = await smartThingsRequest(`/devices/${encodeURIComponent(deviceId)}/commands`, {
-        token,
-        method: 'POST',
-        body: commandPayload
-      });
-      return {
-        ok: true,
-        session_id: sessionId,
-        operation: op,
-        device_id: deviceId,
-        sent_command: commandPayload,
-        result
       };
     }
 

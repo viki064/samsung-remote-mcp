@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import http from 'node:http';
 import readline from 'node:readline';
 import {
@@ -35,6 +38,45 @@ const SERVER_INFO = {
   name: 'samsung-remote-mcp',
   version: '2.0.0'
 };
+
+// One-word Bearer <redacted> for the HTTP endpoints. Set MCP_AUTH_TOKEN in the
+// environment when starting the server, or put the word in
+// ~/.samsung-remote-mcp/auth-token on the host machine (a file outside this
+// repo, never committed or pushed to GitHub). When neither is set the server
+// stays open (auth_enabled: false). The token itself is never stored in this
+// repo - set it on the host machine only, never in chat or in a committed file.
+function readAuthToken() {
+  const fromEnv = (process.env.MCP_AUTH_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  const file = process.env.MCP_AUTH_TOKEN_FILE ||
+    path.join(os.homedir(), '.samsung-remote-mcp', 'auth-token');
+  try {
+    const fromFile = fs.readFileSync(file, 'utf8').trim();
+    if (fromFile) return fromFile;
+  } catch {
+    // No token file - open access.
+  }
+  return '';
+}
+
+const AUTH_TOKEN = readAuthToken();
+
+function isAuthorized(req) {
+  if (!AUTH_TOKEN) return true;
+  const header = req.headers['authorization'] || '';
+  const expected = `Bearer ${AUTH_TOKEN}`;
+  if (header.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) {
+    diff |= header.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function unauthorized(res) {
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Unauthorized' }));
+}
 
 const SESSION_ID_PROP = {
   session_id: {
@@ -1282,7 +1324,7 @@ export function startHttpMcpServer({ host = '0.0.0.0', port = 3000 } = {}) {
   const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Mcp-Session-Id, Authorization');
     res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
 
     if (req.method === 'OPTIONS') {
@@ -1299,7 +1341,7 @@ export function startHttpMcpServer({ host = '0.0.0.0', port = 3000 } = {}) {
         JSON.stringify({
           healthy: true,
           public: true,
-          auth_enabled: false,
+          auth_enabled: Boolean(AUTH_TOKEN),
           session_scoped_tvs: true,
           server: SERVER_INFO,
           transport: 'streamable-http+sse',
@@ -1311,6 +1353,10 @@ export function startHttpMcpServer({ host = '0.0.0.0', port = 3000 } = {}) {
 
     // Legacy SSE endpoint (`GET /sse`)
     if (req.method === 'GET' && url.pathname === '/sse') {
+      if (!isAuthorized(req)) {
+        unauthorized(res);
+        return;
+      }
       const sessionId = normalizeSessionId(url.searchParams.get('sessionId') || crypto.randomUUID());
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -1328,6 +1374,10 @@ export function startHttpMcpServer({ host = '0.0.0.0', port = 3000 } = {}) {
 
     // Streamable HTTP (`POST /mcp`) or SSE message endpoint (`POST /messages`)
     if (req.method === 'POST' && (url.pathname === '/mcp' || url.pathname === '/messages')) {
+      if (!isAuthorized(req)) {
+        unauthorized(res);
+        return;
+      }
       const chunks = [];
       for await (const chunk of req) {
         chunks.push(chunk);
@@ -1406,7 +1456,7 @@ async function main() {
         {
           healthy: true,
           public: true,
-          auth_enabled: false,
+          auth_enabled: Boolean(AUTH_TOKEN),
           session_scoped_tvs: true,
           server: SERVER_INFO,
           tool_count: TOOLS.length,

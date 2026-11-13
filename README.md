@@ -79,3 +79,16 @@ returns 404 on `POST /api/v2/applications/11101200001` and the WebSocket
 `POST http://<ip>:8080/ws/apps/Netflix` (empty body, `Content-Length: 0`)
 returns 201 and the app opens. `dial_app` re-reads the DIAL state after a
 launch/stop, so its result is verified, not fire-and-forget.
+
+
+## One-word security (Bearer <redacted>)
+
+The server has no auth by default. To lock the public Funnel URL with a
+single word, set MCP_AUTH_TOKEN when starting the server:
+
+    MCP_AUTH_TOKEN=<your-word> node src/mcp-server.mjs --http
+
+Clients then send Authorization: Bearer <your-word> on POST /mcp,
+POST /messages and GET /sse. /health stays open (status only) and
+reports auth_enabled: true once a token is set. Pick the word yourself on
+the host machine; never put it in chat or in a committed file.
